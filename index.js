@@ -3,7 +3,8 @@ const React = Spicetify.React;
 function VisualizadorProConfig() {
     const canvasRef = React.useRef(null);
     const audioDataRef = React.useRef({ segments: [], beats: [], loudnessHistory: [] });
-    // Emergency fallback colors
+    
+    // Colores dinámicos
     const colorBotRef = React.useRef({ r: 30, g: 215, b: 96 }); 
     const colorTopRef = React.useRef({ r: 255, g: 255, b: 255 });
 
@@ -13,14 +14,18 @@ function VisualizadorProConfig() {
             sensitivity: 1.0, friction: 0.85, tension: 0.08, 
             bars: 84, brightness: 150, delay: 0, 
             manual: false, hexBot: "#1db954", hexTop: "#ffffff",
-            neon: true // Neon enabled by default
+            neon: true
         };
         try { return saved ? { ...defaultCfg, ...JSON.parse(saved) } : defaultCfg; } catch (e) { return defaultCfg; }
     });
 
     // --- HELPER: HEX TO RGB ---
     const hexToRgb = (hex) => {
+        if (!hex) return null;
         hex = hex.replace('#', '');
+        if (hex.length === 3) {
+            hex = hex.split('').map(c => c + c).join('');
+        }
         return {
             r: parseInt(hex.substring(0, 2), 16) || 0,
             g: parseInt(hex.substring(2, 4), 16) || 0,
@@ -28,46 +33,153 @@ function VisualizadorProConfig() {
         };
     };
 
+    // --- EXTRACTOR DIRECTO DE COLOR DESDE LA IMAGEN DEL ÁLBUM (LOCAL / CANVAS) ---
+    const extractVibrantColorFromImage = (imgUrl) => {
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.crossOrigin = "Anonymous";
+            img.onload = () => {
+                try {
+                    const c = document.createElement("canvas");
+                    const ctx = c.getContext("2d");
+                    c.width = 36;
+                    c.height = 36;
+                    ctx.drawImage(img, 0, 0, 36, 36);
+                    const data = ctx.getImageData(0, 0, 36, 36).data;
+                    
+                    let bestColor = null;
+                    let maxScore = -1;
+                    let avgR = 0, avgG = 0, avgB = 0, validCount = 0;
+
+                    for (let i = 0; i < data.length; i += 4) {
+                        const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+                        if (a < 128) continue;
+                        
+                        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+                        const l = (max + min) / (2 * 255);
+                        const d = (max - min) / 255;
+                        const s = l > 0.5 ? d / (2 - max/255 - min/255 || 1) : d / (max/255 + min/255 || 1);
+                        
+                        avgR += r; avgG += g; avgB += b; validCount++;
+
+                        // Priorizar colores con saturación y luminosidad media (vibrantes)
+                        if (l > 0.15 && l < 0.85) {
+                            const score = s * 2.5 + (1 - Math.abs(l - 0.5));
+                            if (score > maxScore) {
+                                maxScore = score;
+                                bestColor = { r, g, b };
+                            }
+                        }
+                    }
+
+                    if (bestColor) {
+                        resolve(bestColor);
+                    } else if (validCount > 0) {
+                        resolve({ 
+                            r: Math.round(avgR / validCount), 
+                            g: Math.round(avgG / validCount), 
+                            b: Math.round(avgB / validCount) 
+                        });
+                    } else {
+                        resolve(null);
+                    }
+                } catch (e) {
+                    resolve(null);
+                }
+            };
+            img.onerror = () => resolve(null);
+            img.src = imgUrl;
+        });
+    };
+
+    // --- OBTENER COLOR DINÁMICO DEL ÁLBUM ---
+    const colorApiFailedRef = React.useRef(false);
+
+	const toImageUrl = (u) => {
+		if (!u) return null;
+		return u.startsWith("spotify:image:") ? "https://i.scdn.co/image/" + u.slice(14) : u;
+	};
+
+	const getCoverUrl = () => {
+		const meta = Spicetify.Player.data?.item?.metadata || {};
+		return toImageUrl(meta.image_xlarge_url || meta.image_large_url || meta.image_url);
+	};
+
+	const extractFromCover = (url) => new Promise((resolve) => {
+		if (!url) return resolve(null);
+		const img = new Image();
+		img.crossOrigin = "anonymous";
+		img.onload = () => {
+			try {
+				const S = 32;
+				const c = document.createElement("canvas");
+				c.width = c.height = S;
+				const cx = c.getContext("2d", { willReadFrequently: true });
+				cx.drawImage(img, 0, 0, S, S);
+				const d = cx.getImageData(0, 0, S, S).data;
+
+				let best = null, bestScore = -1;
+				for (let i = 0; i < d.length; i += 4) {
+					const r = d[i], g = d[i + 1], b = d[i + 2];
+					const max = Math.max(r, g, b), min = Math.min(r, g, b);
+					const sat = max === 0 ? 0 : (max - min) / max;
+					const lum = (max + min) / 510;
+					const score = sat * (1 - Math.abs(lum - 0.55) * 1.5);
+					if (score > bestScore) { bestScore = score; best = { r, g, b }; }
+				}
+				resolve(bestScore > 0.05 ? best : null);
+			} catch (e) { resolve(null); }
+		};
+		img.onerror = () => resolve(null);
+		img.src = url;
+	});
+
+	const lighten = ({ r, g, b }, amount = 0.55) => ({
+		r: Math.round(r + (255 - r) * amount),
+		g: Math.round(g + (255 - g) * amount),
+		b: Math.round(b + (255 - b) * amount)
+	});
+
+	const applyColor = (rgb) => {
+		colorBotRef.current = rgb;
+		colorTopRef.current = lighten(rgb);
+	};
+
+	const updateDynamicColor = async () => {
+		if (config.manual) return;
+
+		// 1) Portada: fiable, no depende de servidores de Spotify
+		const fromCover = await extractFromCover(getCoverUrl());
+		if (fromCover) { applyColor(fromCover); return; }
+
+		// 2) API oficial, solo si la portada falló y la API no ha muerto ya
+		const uri = Spicetify.Player.data?.item?.uri;
+		if (uri && !colorApiFailedRef.current) {
+			try {
+				const colors = await Spicetify.colorExtractor(uri);
+				const hex = colors?.VIBRANT || colors?.LIGHT_VIBRANT || colors?.PROMINENT || colors?.DARK_VIBRANT;
+				if (hex && /^#?[0-9a-f]{6}$/i.test(hex.trim())) {
+					applyColor(hexToRgb(hex.trim()));
+					return;
+				}
+			} catch (e) {
+				colorApiFailedRef.current = true; // no reintentar en esta sesión
+			}
+		}
+
+		applyColor({ r: 30, g: 215, b: 96 });
+	};
+
     // --- EFFECT: WATCH CONFIG CHANGES ---
     React.useEffect(() => {
         localStorage.setItem("viz_config", JSON.stringify(config));
         if (config.manual) {
-            colorBotRef.current = hexToRgb(config.hexBot);
-            colorTopRef.current = hexToRgb(config.hexTop);
+            colorBotRef.current = hexToRgb(config.hexBot) || { r: 30, g: 215, b: 96 };
+            colorTopRef.current = hexToRgb(config.hexTop) || { r: 255, g: 255, b: 255 };
         } else {
-            updateDynamicColor(); // Trigger auto extraction immediately
+            updateDynamicColor();
         }
     }, [config]);
-
-    const updateDynamicColor = async () => {
-        if (config.manual) return;
-
-        try {
-            const uri = Spicetify.Player.data?.item?.uri;
-            if (!uri) return;
-
-            const colors = await Spicetify.colorExtractor(uri).catch(() => null);
-            
-            if (colors && colors.vibrant) {
-                const rgbBot = hexToRgb(colors.vibrant);
-                colorBotRef.current = rgbBot;
-                
-                // Auto calculate a brighter, slightly desaturated Top color for nice gradient
-                colorTopRef.current = {
-                    r: Math.min(255, rgbBot.r + 100),
-                    g: Math.min(255, rgbBot.g + 100),
-                    b: Math.min(255, rgbBot.b + 100)
-                };
-            } else {
-                // Fallback
-                colorBotRef.current = { r: 30, g: 215, b: 96 };
-                colorTopRef.current = { r: 255, g: 255, b: 255 };
-            }
-        } catch (e) {
-            colorBotRef.current = { r: 30, g: 215, b: 96 };
-            colorTopRef.current = { r: 255, g: 255, b: 255 };
-        }
-    };
 
     const fetchAudioData = async () => {
         const item = Spicetify.Player.data?.item;
@@ -76,14 +188,15 @@ function VisualizadorProConfig() {
         try {
             const data = await Spicetify.getAudioData(item.uri);
             audioDataRef.current = data ? { segments: data.segments || [], beats: data.beats || [], loudnessHistory: [] } : { segments: [], beats: [], loudnessHistory: [] };
-        } catch (e) { audioDataRef.current = { segments: [], beats: [], loudnessHistory: [] }; }
+        } catch (e) { 
+            audioDataRef.current = { segments: [], beats: [], loudnessHistory: [] }; 
+        }
     };
 
     React.useEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
         
-        // Alpha false for better performance, but need to clear with fillRect
         const ctx = canvas.getContext('2d', { alpha: false });
         let animationId;
         let heights = new Array(200).fill(5), vels = new Array(200).fill(0);
@@ -121,23 +234,48 @@ function VisualizadorProConfig() {
             const n = config.bars || 84;
             const mH = canvas.height * 0.75 * (config.sensitivity || 1.0);
 
-            let tPitches = new Array(12).fill(0);
-            let avgNormalizedVolume = 0; // Needed for dynamic neon
+            let pseudoFreqBands = new Array(16).fill(0);
+            let avgNormalizedVolume = 0;
 
             if (isPlaying && segments && segments.length > 0) {
                 const sIdx = segments.findIndex(s => exactTime >= s.start && exactTime < (s.start + s.duration));
                 if (sIdx !== -1) {
                     const s1 = segments[sIdx], s2 = segments[sIdx + 1] || s1;
                     const ease = (1 - Math.cos(Math.max(0, Math.min(1, (exactTime - s1.start) / s1.duration)) * Math.PI)) / 2;
+                    
                     loudnessHistory.push(s1.loudness_max);
                     if (loudnessHistory.length > 100) loudnessHistory.shift();
                     const avgLoudness = Math.max(...loudnessHistory, -20);
                     
-                    avgNormalizedVolume = Math.pow(Math.max(0, (s1.loudness_max + 60) / (avgLoudness + 60)), 2.5);
+                    avgNormalizedVolume = Math.pow(Math.max(0, (s1.loudness_max + 60) / (avgLoudness + 60)), 2.2);
                     
                     const beat = beats.find(b => exactTime >= b.start && exactTime < (b.start + b.duration));
-                    const bst = 1 + (beat ? Math.max(0, 1 - (exactTime - beat.start) / (beat.duration * 0.8)) : 0) * 0.9;
-                    tPitches = s1.pitches.map((p, i) => ((p * (1 - ease)) + (s2.pitches[i] * ease)) * avgNormalizedVolume * bst);
+                    const beatImpact = (beat ? Math.max(0, 1 - (exactTime - beat.start) / (beat.duration * 0.7)) : 0) * 1.2;
+
+                    const interpPitches = s1.pitches.map((p, i) => (p * (1 - ease)) + ((s2.pitches?.[i] ?? p) * ease));
+                    const interpTimbre = (s1.timbre || []).map((t, i) => (t * (1 - ease)) + ((s2.timbre?.[i] ?? t) * ease));
+
+                    const bassEnergy = ((interpTimbre[0] || 0) + 100) / 200 + (interpTimbre[1] || 0) * 0.005 + beatImpact;
+                    const trebleEnergy = ((interpTimbre[2] || 0) + (interpTimbre[3] || 0)) * 0.008;
+
+                    for (let b = 0; b < 16; b++) {
+                        let val = 0;
+                        if (b < 4) {
+                            // Graves: dominados por ritmo y frecuencias base
+                            const pSum = (interpPitches[0] + interpPitches[1] + interpPitches[7]) / 3;
+                            val = (bassEnergy * 0.75 + pSum * 0.25) * (1.2 - (b * 0.08));
+                        } else if (b < 11) {
+                            // Medios: armónicos vocales e instrumentos
+                            const pIdx = (b - 4) * 2;
+                            const pVal = (interpPitches[pIdx % 12] + interpPitches[(pIdx + 4) % 12]) / 2;
+                            val = pVal * 0.85 + (avgNormalizedVolume * 0.3);
+                        } else {
+                            // Agudos: brillo tímbrico y sobretonos
+                            const pIdx = (b - 11) * 3;
+                            val = (interpPitches[pIdx % 12] * 0.35) + Math.max(0, trebleEnergy) * 0.65 + (avgNormalizedVolume * 0.2);
+                        }
+                        pseudoFreqBands[b] = Math.max(0, val * avgNormalizedVolume);
+                    }
                 }
             }
 
@@ -146,7 +284,6 @@ function VisualizadorProConfig() {
             const brightness = config.brightness || 150;
 
             const grad = ctx.createLinearGradient(0, canvas.height - mH, 0, canvas.height);
-            // Mix white into the top color based on the config brightness setting
             const finalTopR = Math.min(255, cTop.r + brightness);
             const finalTopG = Math.min(255, cTop.g + brightness);
             const finalTopB = Math.min(255, cTop.b + brightness);
@@ -156,10 +293,8 @@ function VisualizadorProConfig() {
 
             // --- NEON SETTINGS ---
             if (config.neon) {
-                // Neon intensifies with volume and height
                 const neonIntensity = 5 + (avgNormalizedVolume * 15);
                 ctx.shadowBlur = neonIntensity;
-                // Shadow color based on bottom color for better bloom effect
                 ctx.shadowColor = `rgba(${cBot.r}, ${cBot.g}, ${cBot.b}, 0.7)`; 
             } else {
                 ctx.shadowBlur = 0;
@@ -167,9 +302,13 @@ function VisualizadorProConfig() {
 
             const bW = (canvas.width / n);
             for (let i = 0; i < n; i++) {
-                const pos = (i / (n - 1)) * 11, iL = Math.floor(pos), iR = Math.min(11, iL + 1), p = pos - iL;
+                const pos = (i / (n - 1)) * 15;
+                const iL = Math.floor(pos);
+                const iR = Math.min(15, iL + 1);
+                const p = pos - iL;
                 const curve = (1 - Math.cos(p * Math.PI)) / 2;
-                let tH = isPlaying ? ((tPitches[iL] * (1 - curve)) + (tPitches[iR] * curve)) * mH + 5 : 5;
+
+                let tH = isPlaying ? ((pseudoFreqBands[iL] * (1 - curve)) + (pseudoFreqBands[iR] * curve)) * mH + 5 : 5;
                 vels[i] = (vels[i] + (tH - heights[i]) * config.tension) * config.friction;
                 heights[i] += vels[i];
                 
@@ -178,10 +317,8 @@ function VisualizadorProConfig() {
                 const x = i * bW;
 
                 ctx.fillStyle = grad;
-                // Draw bar. shadowBlur applied automatically here if enabled
-                ctx.fillRect(x, y, bW - 3, finalH); 
+                ctx.fillRect(x, y, Math.max(1, bW - 2), finalH); 
             }
-            // Reset shadowBlur so it doesn't affect other drawings (like settings panel if rendered on canvas)
             ctx.shadowBlur = 0; 
             
             animationId = requestAnimationFrame(renderLoop);
